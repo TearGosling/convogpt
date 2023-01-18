@@ -93,13 +93,14 @@ class SFT_Trainer:
         self.model = model
         self.tokenizer = tokenizer
         self.train_dataloader = train_dataloader
+        self.eval_dataloader = eval_dataloader
         self.optimizer = optimizer
         self.weight_dtype = weight_dtype
         self.args = args
 
         if accelerator.is_main_process:
             self.progress_bar = tqdm.tqdm(
-                total=self.args.epochs*len(train_dataloader),
+                total=self.args.epochs * (len(train_dataloader) + len(eval_dataloader)),
                 desc="Total Steps",
                 leave=False,
             )
