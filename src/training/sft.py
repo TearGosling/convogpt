@@ -84,6 +84,7 @@ class SFT_Trainer:
         model: AutoModelForCausalLM,
         tokenizer: AutoTokenizer,
         train_dataloader: torch.utils.data.DataLoader,
+        eval_dataloader: torch.utils.data.DataLoader,
         optimizer: torch.optim.Optimizer,
         weight_dtype: torch.dtype,
         args: argparse.Namespace,
@@ -123,7 +124,7 @@ class SFT_Trainer:
         if self.accelerator.is_main_process:
             self.tokenizer.save_pretrained(path)
 
-    def step(self, batch: dict) -> None:
+    def train_step(self, batch: dict) -> None:
         with self.accelerator.accumulate(self.model):
             input_ids = batch['input_ids']
             attention_mask = batch['attention_mask']
@@ -157,16 +158,50 @@ class SFT_Trainer:
         return {
             "train/loss": loss.detach().item(),
         }
-    
+
+    def eval_step(self, batch: dict) -> None:
+        input_ids = batch['input_ids']
+        attention_mask = batch['attention_mask']
+        start_positions = batch['start_positions']
+        end_positions = batch['end_positions']
+
+        with torch.no_grad():
+            try:
+                outputs = sft_forward(
+                    self.model,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    start_positions=start_positions,
+                    end_positions=end_positions,
+                )
+                loss = outputs.loss
+                perplexity = torch.exp(loss)
+            # There shouldn't be a RuntimeError if there's no grad but
+            # I'm keeping this here anyway
+            except RuntimeError as e:
+                print(f"RuntimeError: {e}")
+                print(f"input_ids: {input_ids}")
+                print(f"attention_mask: {attention_mask}")
+                print(f"start_positions: {start_positions}")
+                print(f"end_positions: {end_positions}")
+                print('Skipping batch...')
+                loss = torch.tensor(float('nan'), device=self.accelerator.device)
+
+        return {
+            "eval/loss": loss.item(),
+            "eval/perplexity": perplexity.item(),
+        }
+
     def train(self) -> None:
         self.model.train()
         for epoch in range(self.args.epochs):
+            # Training loop
             for _, batch in enumerate(self.train_dataloader):
                 step_start = time.perf_counter()
 
                 #print(f"####\n{self.tokenizer.decode(batch['input_ids'][0])}\n#{batch['start_positions'][0]}:{batch['end_positions'][0]}\n####")
 
-                metrics = self.step(batch)
+                metrics = self.train_step(batch)
 
                 step_end = time.perf_counter()
 
@@ -191,6 +226,33 @@ class SFT_Trainer:
 
                     if self.global_step % self.args.save_steps == 0:
                         self.save_model()
+            # Eval loop
+            for _, batch in enumerate(self.eval_dataloader):
+                step_start = time.perf_counter()
+                
+                metrics = self.eval_step(batch)
+
+                step_end = time.perf_counter()
+
+                if self.accelerator.is_main_process:
+                    rank_samples_per_second = self.args.batch_size / (step_end - step_start)
+                    world_samples_per_second = rank_samples_per_second * self.accelerator.num_processes
+
+                    metrics.update({
+                        "perf/rank_samples_per_second": rank_samples_per_second,
+                        "perf/world_samples_per_second": world_samples_per_second,
+                        "eval/epoch": epoch,
+                        "eval/step": self.global_step,
+                        "eval/samples_seen": self.global_step * self.args.batch_size,
+                    })
+
+                    self.global_step += 1
+
+                    self.progress_bar.update(1)
+                    self.progress_bar.set_postfix(**metrics)
+
+                    self.run.log(metrics, step=self.global_step)
+
         self.accelerator.wait_for_everyone()
         self.save_model()
 
@@ -198,7 +260,8 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Supervised GPT finetuning")
     parser.add_argument("--model", type=str, default="hakurei/gpt-j-random-tinier", help="Model name")
-    parser.add_argument("--dataset", type=str, default="train.jsonl", help="Training file")
+    parser.add_argument("--train_dataset", type=str, default="train.jsonl", help="Training file")
+    parser.add_argument("--eval_dataset", type=str, default="eval.jsonl", help="Eval file")
     parser.add_argument("--output_dir", type=str, default="output", help="Output directory")
     parser.add_argument("--epochs", type=int, default=1, help="Number of epochs")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
@@ -232,10 +295,18 @@ def main() -> None:
             "end_positions": end_positions,
         }
     
-    train_dataset = SFTDataset(args.dataset, tokenizer)
+    train_dataset = SFTDataset(args.train_dataset, tokenizer)
+    eval_dataset = SFTDataset(args.eval_dataset, tokenizer)
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
+    )
+
+    eval_dataloader = torch.utils.data.DataLoader(
+        eval_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
@@ -251,8 +322,8 @@ def main() -> None:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
 
-    model, optimizer, train_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader
+    model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
+        model, optimizer, train_dataloader, eval_dataloader
     )
 
     trainer = SFT_Trainer(
@@ -260,6 +331,7 @@ def main() -> None:
         model=model,
         tokenizer=tokenizer,
         train_dataloader=train_dataloader,
+        eval_dataloader=eval_dataloader,
         optimizer=optimizer,
         weight_dtype=None,
         args=args,

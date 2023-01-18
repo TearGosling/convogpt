@@ -1,7 +1,8 @@
 #!/bin/bash
 
 BASE_MODEL="hakurei/lit-125M"
-DATASET="train-small.jsonl"
+TRAIN_DATASET="train-small.jsonl"
+EVAL_DATASET="eval-small.jsonl"
 OUTPUT_DIR="models/convogpt-small"
 EPOCHS=2
 BATCH_SIZE=1
@@ -10,7 +11,8 @@ LEARNING_RATE=1e-5
 
 accelerate launch src/training/sft.py \
     --model $BASE_MODEL \
-    --dataset $DATASET \
+    --train_dataset $TRAIN_DATASET \
+    --eval_dataset $EVAL_DATASET \
     --output_dir $OUTPUT_DIR \
     --epochs $EPOCHS \
     --batch_size $BATCH_SIZE \
