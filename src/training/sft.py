@@ -1,4 +1,5 @@
 import os
+import math
 import torch
 import accelerate
 import tqdm
@@ -176,7 +177,6 @@ class SFT_Trainer:
                     end_positions=end_positions,
                 )
                 loss = outputs.loss
-                perplexity = torch.exp(loss)
             # There shouldn't be a RuntimeError if there's no grad but
             # I'm keeping this here anyway
             except RuntimeError as e:
@@ -188,10 +188,7 @@ class SFT_Trainer:
                 print('Skipping batch...')
                 loss = torch.tensor(float('nan'), device=self.accelerator.device)
 
-        return {
-            "eval/loss": loss.item(),
-            "eval/perplexity": perplexity.item(),
-        }
+        return loss
 
     def train(self) -> None:
         self.model.train()
@@ -228,10 +225,16 @@ class SFT_Trainer:
                     if self.global_step % self.args.save_steps == 0:
                         self.save_model()
             # Eval loop
+            self.model.eval()
+            eval_losses = []
+
             for _, batch in enumerate(self.eval_dataloader):
                 step_start = time.perf_counter()
                 
-                metrics = self.eval_step(batch)
+                # Calculate losses
+                loss = self.eval_step(batch).unsqueeze(0)
+                eval_losses.append(loss)
+                metrics = {}
 
                 step_end = time.perf_counter()
 
@@ -253,6 +256,20 @@ class SFT_Trainer:
                     self.progress_bar.set_postfix(**metrics)
 
                     self.run.log(metrics, step=self.global_step)
+            # calculate average loss and perplexity
+            eval_losses = torch.cat(eval_losses)
+            eval_losses = eval_losses[:len(self.eval_dataloader)]
+            try:
+                eval_loss = torch.mean(eval_losses)
+                perplexity = math.exp(eval_loss)
+            except OverflowError:
+                perplexity = float("inf")
+            eval_metrics = {
+                "eval/loss": eval_loss,
+                "eval/perplexity": perplexity,
+            }
+            # TODO(TG): This doesn't actually show up in W&B for some reason.
+            self.run.log(eval_metrics, step=epoch)
 
         self.accelerator.wait_for_everyone()
         self.save_model()
