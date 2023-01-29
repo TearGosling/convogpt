@@ -34,11 +34,11 @@ def sft_forward(
     except AttributeError:
         return_dict = True
 
-    outputs = self.transformer(
+    outputs = self.gpt_neox(
         input_ids,
         attention_mask=attention_mask,
-        token_type_ids=token_type_ids,
-        position_ids=position_ids,
+        #token_type_ids=token_type_ids,
+        #position_ids=position_ids,
         head_mask=head_mask,
         inputs_embeds=inputs_embeds,
         output_attentions=output_attentions,
@@ -48,24 +48,24 @@ def sft_forward(
 
     sequence_output = outputs[0]
 
-    logits = self.lm_head(sequence_output)
+    logits = self.embed_out(sequence_output)
 
     answer_logits = logits[:, start_positions[0]:end_positions[0]+1]
     answer_input_ids = input_ids[:, start_positions[0]:end_positions[0]+1]
 
-    prompt_logits = logits[:, :start_positions[0]]
-    prompt_input_ids = input_ids[:, :start_positions[0]]
+    #prompt_logits = logits[:, :start_positions[0]]
+    #prompt_input_ids = input_ids[:, :start_positions[0]]
 
     # compute loss for prompt and answer
     loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-1)
     shift_answer_logits = answer_logits[..., :-1, :].contiguous()
     shift_answer_labels = answer_input_ids[..., 1:].contiguous()
-    shift_prompt_logits = prompt_logits[..., :-1, :].contiguous()
-    shift_prompt_labels = prompt_input_ids[..., 1:].contiguous()
+    #shift_prompt_logits = prompt_logits[..., :-1, :].contiguous()
+    #shift_prompt_labels = prompt_input_ids[..., 1:].contiguous()
     answer_loss = loss_fct(shift_answer_logits.view(-1, answer_logits.size(-1)), shift_answer_labels.view(-1))
-    prompt_loss = loss_fct(shift_prompt_logits.view(-1, prompt_logits.size(-1)), shift_prompt_labels.view(-1))
+    #prompt_loss = loss_fct(shift_prompt_logits.view(-1, prompt_logits.size(-1)), shift_prompt_labels.view(-1))
 
-    loss = (prompt_loss + answer_loss) / 2
+    loss = answer_loss
 
     if not return_dict:
         output = (loss,) + outputs[2:]
@@ -106,16 +106,18 @@ class SFT_Trainer:
                 leave=False,
             )
 
-            self.run = wandb.init(
-                project="convogpt-sftlm",
-                name=f'{self.args.model}-{self.args.epochs}-{self.args.batch_size}-{self.args.learning_rate}--{int(time.time())}',
-                config=self.args,
-            )
+            #self.run = wandb.init(
+            #    project="convogpt-sftlm",
+            #    name=f'{self.args.model}-{self.args.epochs}-{self.args.batch_size}-{self.args.learning_rate}--{int(time.time())}',
+            #    config=self.args,
+            #)
+            self.writer = torch.utils.tensorboard.SummaryWriter(log_dir=f"{self.args.output_dir}/runs", comment="")
 
             self.global_step = 0
+            self.completed_steps = 0
     
     def save_model(self) -> None:
-        path = f'{self.args.output_dir}/{self.run.name}'
+        path = f'{self.args.output_dir}/'
         os.makedirs(path, exist_ok=True)
         unwrapped_model = self.accelerator.unwrap_model(self.model)
         unwrapped_model.save_pretrained(
@@ -216,60 +218,70 @@ class SFT_Trainer:
                     })
 
                     self.global_step += 1
+                    self.completed_steps += 1
 
                     self.progress_bar.update(1)
                     self.progress_bar.set_postfix(**metrics)
 
-                    self.run.log(metrics, step=self.global_step)
+                    #self.run.log(metrics, step=self.global_step)
+                    for k, v in metrics.items():
+                        self.writer.add_scalar(k, v, self.global_step)
 
                     if self.global_step % self.args.save_steps == 0:
                         self.save_model()
-            # Eval loop
-            self.model.eval()
-            eval_losses = []
+                        # Eval here
+                        # TODO(TG): Holy fuck, this code is atrocious. I gotta fix this shit
+                        self.model.eval()
+                        eval_losses = []
 
-            for _, batch in enumerate(self.eval_dataloader):
-                step_start = time.perf_counter()
-                
-                # Calculate losses
-                loss = self.eval_step(batch).unsqueeze(0)
-                eval_losses.append(loss)
-                metrics = {}
+                        for _, batch in enumerate(self.eval_dataloader):
+                            step_start = time.perf_counter()
 
-                step_end = time.perf_counter()
+                            # Calculate losses
+                            loss = self.eval_step(batch).unsqueeze(0)
+                            eval_losses.append(loss)
+                            metrics = {}
 
-                if self.accelerator.is_main_process:
-                    rank_samples_per_second = self.args.batch_size / (step_end - step_start)
-                    world_samples_per_second = rank_samples_per_second * self.accelerator.num_processes
+                            step_end = time.perf_counter()
 
-                    metrics.update({
-                        "perf/rank_samples_per_second": rank_samples_per_second,
-                        "perf/world_samples_per_second": world_samples_per_second,
-                        "eval/epoch": epoch,
-                        "eval/step": self.global_step,
-                        "eval/samples_seen": self.global_step * self.args.batch_size,
-                    })
+                            if self.accelerator.is_main_process:
+                                rank_samples_per_second = self.args.batch_size / (step_end - step_start)
+                                world_samples_per_second = rank_samples_per_second * self.accelerator.num_processes
 
-                    self.global_step += 1
+                                metrics.update({
+                                    "perf/rank_samples_per_second": rank_samples_per_second,
+                                    "perf/world_samples_per_second": world_samples_per_second,
+                                    "eval/epoch": epoch,
+                                    "eval/step": self.global_step,
+                                    "eval/samples_seen": self.global_step * self.args.batch_size,
+                                })
 
-                    self.progress_bar.update(1)
-                    self.progress_bar.set_postfix(**metrics)
+                                self.global_step += 1
 
-                    self.run.log(metrics, step=self.global_step)
-            # calculate average loss and perplexity
-            eval_losses = torch.cat(eval_losses)
-            eval_losses = eval_losses[:len(self.eval_dataloader)]
-            try:
-                eval_loss = torch.mean(eval_losses)
-                perplexity = math.exp(eval_loss)
-            except OverflowError:
-                perplexity = float("inf")
-            eval_metrics = {
-                "eval/loss": eval_loss,
-                "eval/perplexity": perplexity,
-            }
-            # TODO(TG): This doesn't actually show up in W&B for some reason.
-            self.run.log(eval_metrics, step=epoch)
+                                self.progress_bar.update(1)
+                                self.progress_bar.set_postfix(**metrics)
+
+                                #self.run.log(metrics, step=self.global_step)
+                                for k, v in metrics.items():
+                                    self.writer.add_scalar(k, v, self.global_step)
+                                    
+                        # calculate average loss and perplexity
+                        eval_losses = torch.cat(eval_losses)
+                        eval_losses = eval_losses[:len(self.eval_dataloader)]
+                        try:
+                            eval_loss = torch.mean(eval_losses)
+                            perplexity = math.exp(eval_loss)
+                        except OverflowError:
+                            perplexity = float("inf")
+                        eval_metrics = {
+                            "eval/loss": eval_loss,
+                            "eval/perplexity": perplexity,
+                        }
+
+                        for k, v in eval_metrics.items():
+                            self.writer.add_scalar(k, v, epoch)
+                            
+                        self.model.train()
 
         self.accelerator.wait_for_everyone()
         self.save_model()
@@ -285,6 +297,7 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
     parser.add_argument("--save_steps", type=int, default=1000, help="Save model every x steps")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--bitsandbytes", action="store_true", default=False, help="Use bitsandbytes")
     args = parser.parse_args()
 
     accelerator = accelerate.Accelerator()
@@ -332,13 +345,16 @@ def main() -> None:
 
     model = AutoModelForCausalLM.from_pretrained(args.model)
     optim_cls = torch.optim.AdamW
-    try:
-        import bitsandbytes as bnb
-        optim_cls = bnb.optim.AdamW8bit
-    except ImportError:
-        pass
+    if args.bitsandbytes:
+        try:
+            import bitsandbytes as bnb
+            print("Using 8-bit optimizer...")
+            optim_cls = bnb.optim.AdamW8bit
+        except ImportError:
+            print("bitsandbytes is not installed, using default torch optimizer...")
+            pass
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer = optim_cls(model.parameters(), lr=args.learning_rate)
 
     model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader
